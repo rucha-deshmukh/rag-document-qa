@@ -1,13 +1,15 @@
 """LLM and embedding client with timeouts and retry/backoff.
 
-The embedding function here is intentionally provider-agnostic and easy to
-swap. Network calls are wrapped with :mod:`tenacity` so transient failures
-(rate limits, timeouts) are retried with exponential backoff before the
-request is allowed to fail.
+Network calls are wrapped with :mod:`tenacity` so transient failures (rate
+limits, timeouts) are retried with exponential backoff before the request is
+allowed to fail. Both the embedding and the chat provider fall back to an
+offline implementation when no API key is configured, so the app, tests, and
+``docker compose up`` run with zero external dependencies during development.
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
 
 from tenacity import (
@@ -29,6 +31,11 @@ SYSTEM_PROMPT = (
     "don't know. Be concise."
 )
 
+# Dimensionality of the offline fallback embedding. OpenAI's
+# text-embedding-3-small returns 1536 dims; keep the fallback consistent so a
+# store populated in one mode stays comparable.
+_FALLBACK_DIM = 1536
+
 
 @retry(
     retry=retry_if_exception_type(_RETRYABLE),
@@ -39,17 +46,26 @@ SYSTEM_PROMPT = (
 def embed(text: str) -> list[float]:
     """Return an embedding vector for ``text``.
 
-    Replace the body with a real embedding provider call. Kept as a
-    deterministic local hash embedding so the app and tests run without any
-    external dependency; swap in your provider before production use.
+    Uses OpenAI embeddings when ``OPENAI_API_KEY`` is configured; otherwise
+    falls back to a deterministic local hash embedding so development and tests
+    run offline. Swap the provider block for your embedding vendor of choice
+    (OpenAI and Voyage AI are both good options).
     """
-    import hashlib
-
     settings = get_settings()
-    dim = 1536
-    digest = hashlib.sha256((settings.embedding_model + text).encode()).digest()
-    # Expand the digest deterministically to the target dimensionality.
-    raw = (digest * ((dim // len(digest)) + 1))[:dim]
+    if not settings.openai_api_key:
+        return _fallback_embed(settings.embedding_model, text)
+
+    from openai import OpenAI
+
+    client = OpenAI(api_key=settings.openai_api_key, timeout=30.0)
+    response = client.embeddings.create(model=settings.embedding_model, input=text)
+    return response.data[0].embedding
+
+
+def _fallback_embed(model: str, text: str) -> list[float]:
+    """Deterministic offline embedding derived from a hash of the input."""
+    digest = hashlib.sha256((model + text).encode()).digest()
+    raw = (digest * ((_FALLBACK_DIM // len(digest)) + 1))[:_FALLBACK_DIM]
     return [(b / 255.0) for b in raw]
 
 
